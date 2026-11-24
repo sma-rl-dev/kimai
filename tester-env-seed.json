@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "app": "kimai",
+  "seed_profile": "default",
+  "requirements": {
+    "admin-login": {
+      "status": "present",
+      "evidence": "./tester-env verify logs in as admin / tester-env-password at /en/login and asserts the authenticated /en/timesheet/ page, with no first-login wizard redirect."
+    },
+    "seeded-users-roles": {
+      "status": "present",
+      "evidence": "Seed creates four users with fixed credentials (password tester-env-password): lena (ROLE_ADMIN), mara (ROLE_TEAMLEAD), jonas and priya (ROLE_USER). They join the site admin (ROLE_SUPER_ADMIN) for five enabled users; aliases Lena Fischer / Mara Hoffmann / Jonas Weber / Priya Nair and fixed colors are shown in the user list."
+    },
+    "seeded-team": {
+      "status": "present",
+      "evidence": "Team 'Delivery' (id 1001) contains all four seeded users; mara is teamlead. /en/admin/teams/ lists Delivery with its four members, and all seeded customers/projects/activities belong to the team so non-admin users see the data."
+    },
+    "seeded-customers": {
+      "status": "present",
+      "evidence": "Three visible EUR customers: Harborline Media (0101), Northstar Logistics (0102), Copperline Bakery (0103). /en/admin/customer/ lists all three; verify asserts the names in the HTML."
+    },
+    "seeded-projects": {
+      "status": "present",
+      "evidence": "Five projects: Website Relaunch (100h time budget), Monthly Retainer (40h time budget), Brand Refresh, Fleet Portal (EUR 12,000 money budget) and the ended Warehouse Audit (end 2026-09-30, no entries) for inactive-project views."
+    },
+    "seeded-activities": {
+      "status": "present",
+      "evidence": "Eleven project activities (Development, Design, Code Review, Support, Project Management, Content Writing, Audit Preparation) plus the global 'Internal Meeting' activity usable on any project."
+    },
+    "seeded-rates": {
+      "status": "present",
+      "evidence": "Customer rates Harborline 95/h, Northstar 110/h, Copperline 75/h; project override Fleet Portal 115/h; activity overrides Design 85/h, Code Review 95/h, Content Writing 75/h. Timesheet rows carry the matching hourly_rate and total rate."
+    },
+    "seeded-budgets": {
+      "status": "present",
+      "evidence": "Time budgets: Website Relaunch 100:00 (51:00 used), Monthly Retainer 40:00 (18:30 used), activity Design 20:00 (13:00 used). Money budgets: Fleet Portal EUR 12,000.00 (EUR 2,587.50 used), activity Code Review EUR 1,500.00 (EUR 380.00 used)."
+    },
+    "seeded-tags": {
+      "status": "present",
+      "evidence": "Six visible tags: frontend (5 entries), backend (8), design (10), code-review (2), maintenance (1), client-meeting (6); 32 tag links across 48 timesheets, 16 untagged entries for empty-filter checks."
+    },
+    "seeded-timesheets-stopped": {
+      "status": "present",
+      "evidence": "48 timesheet rows, all stopped (end_time set), ids 1001-1048, distributed to admin 6, jonas 12, priya 14, mara 8, lena 8."
+    },
+    "seeded-timesheets-billable-mix": {
+      "status": "present",
+      "evidence": "45 billable (EUR 10,260.00) and 3 non-billable rows (EUR 665.00): Sprint 42 planning and Internal planning (project management) and Quarterly team retro (Internal Meeting)."
+    },
+    "seeded-timesheet-date-range": {
+      "status": "present",
+      "evidence": "Fixed UTC dates 2026-10-05 .. 2026-11-20 on 28 distinct working days; total duration 115:00 (414,000 s). No NOW()/rand() in the seed, so counts and sums are stable."
+    },
+    "seeded-wizard-off": {
+      "status": "present",
+      "evidence": "tester-env.d/wizard-off.sql runs after every deploy and seed: __wizards__ = 'intro,profile' exists for all five users and configuration user.wizard = 0. verify asserts the preference count and logs in as mara/jonas without a wizard redirect."
+    },
+    "seeded-user-visibility": {
+      "status": "present",
+      "evidence": "Non-admin users see the seeded customers, projects, activities and their own timesheets through the Delivery team. verify logs in as mara, jonas and priya and greps their own seeded timesheet descriptions from /en/timesheet/."
+    },
+    "project-budget-counts-billable-time": {
+      "status": "present",
+      "evidence": "Kimai's time-budget card (templates/embeds/budgets.html.twig) renders the quota bar and used percentage from billable duration only, while the project list column shows total working time. Website Relaunch has 51:00 total (44:00 billable + 7:00 non-billable: Sprint 42 planning, Quarterly team retro, Internal planning), so the list reads 51:00 and the quota bar reads 44:00 / 100:00. Fleet Portal revenue is billable rate only: EUR 2,587.50 / 12,000.00. verify pins 183,600 s total, 158,400 s billable and 2,587.50 revenue; assert the list number and the quota number separately, never as equal."
+    }
+  }
+}

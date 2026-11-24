@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+# Kimai - Tester Environment CLI. See docs/APP_CLI_PATTERN.md in the corpus
+# repo; this file lives at the app checkout root.
+#
+# Topology: app (PHP 8.5/Apache, built from this checkout) + MariaDB 10.11.
+# The upstream entrypoint is deterministic and idempotent: it waits for the DB,
+# runs `kimai:install` (create database + 82 migrations), creates the super
+# admin from ADMINMAIL/ADMINPASS with --ignore-existing, clears the cache and
+# starts Apache on 8001.
+#
+# Mutation path: PHP/Twig edits need a rebuild (`deploy`), because prod keeps
+# opcache.validate_timestamps=0 and the source is baked into the image.
+# tester-env.d/Containerfile installs composer deps in their own layer, so an
+# incremental rebuild only re-copies the source.
+#
+# Commands: deploy, seed, verify, wizard-off, reset, stop, start, logs, status, url, help
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-18280}"
+
+# The upstream entrypoint creates the user named `admin`
+# (`kimai:user:create --ignore-existing admin ...`), so only mail/password vary.
+ADMIN_EMAIL="${DEFAULT_ADMIN_EMAIL:-admin@example.com}"
+ADMIN_PASSWORD="${DEFAULT_ADMIN_PASSWORD:-tester-env-password}"
+
+# Fixed dev values, same as docker-compose.tester-env.yml. Only the app port is
+# published; MariaDB stays on the compose network.
+DB_USER="kimai"
+DB_PASSWORD="kimai"
+DB_NAME="kimai"
+
+# PHP/Apache base with the compiled extensions, built once from upstream's
+# Dockerfile `base` target (see tester-env.d/Containerfile).
+BASE_IMAGE="tester-env-kimai-base:dev"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    COMPOSE_PROJECT="tester-env-kimai${suffix}"
+    export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-kimai:dev}"
+    export PORT
+    export ADMINMAIL="${ADMIN_EMAIL}" ADMINPASS="${ADMIN_PASSWORD}"
+    export KIMAI_BASE_IMAGE="${BASE_IMAGE}"
+    if [[ -n "${IMAGE_TAG:-}" ]]; then
+        export IMAGE_TAG
+    fi
+}
+
+compose() {
+    docker compose -p "${COMPOSE_PROJECT}" -f "${SCRIPT_DIR}/docker-compose.tester-env.yml" "$@"
+}
+
+# Runs SQL inside the db container: stdin is a script, -e is a statement.
+db() {
+    compose exec -T -e MYSQL_PWD="${DB_PASSWORD}" db mariadb -u"${DB_USER}" "${DB_NAME}" "$@"
+}
+
+web() {
+    echo "http://127.0.0.1:${PORT}"
+}
+
+build_base() {
+    echo "==> Ensuring ${BASE_IMAGE} (PHP 8.5/apache, extensions; cached after the first build)..."
+    docker build --quiet \
+        --build-arg BASE=apache \
+        --target base \
+        -t "${BASE_IMAGE}" \
+        -f "${SCRIPT_DIR}/Dockerfile" \
+        "${SCRIPT_DIR}" > /dev/null
+}
+
+wait_http() {
+    # /en/login is served directly (no locale negotiation, no session needed).
+    # First start runs install + 82 migrations, so allow ~6 minutes.
+    echo "==> Waiting for GET /en/login (up to ~6 min: first start installs the schema)..."
+    for _ in $(seq 1 180); do
+        if curl -fsS -o /dev/null "$(web)/en/login" 2>/dev/null; then
+            echo "==> App is ready at http://localhost:${PORT}"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "==> Timed out waiting for GET /en/login" >&2
+    compose logs --tail=80 app db || true
+    return 1
+}
+
+# CSRF-protected Symfony form login: GET /en/login, reuse its _csrf_token and
+# form action, POST _username/_password, then require an authenticated page.
+login_jar() { # login_jar <cookie-jar> [username]
+    local jar="$1" username="${2:-admin}" page token action url redirect body_file final
+    page="$(curl -fsS -c "${jar}" "$(web)/en/login")"
+    token="$(grep -o 'name="_csrf_token" value="[^"]*"' <<<"${page}" | head -1 | sed 's/.*value="//; s/"$//')"
+    action="$(grep -o '<form[^>]*action="[^"]*"' <<<"${page}" | head -1 | sed 's/.*action="//; s/"$//')"
+    if [[ -z "${token}" || -z "${action}" ]]; then
+        echo "==> Login form not parsed (no _csrf_token or form action)" >&2
+        return 1
+    fi
+    case "${action}" in
+        http*) url="${action}" ;;
+        /*)    url="$(web)${action}" ;;
+        *)     url="$(web)/en/${action}" ;;
+    esac
+    # No -L: the post-login target is an absolute path such as /en/timesheet/.
+    redirect="$(curl -sS -b "${jar}" -c "${jar}" -o /dev/null -w '%{redirect_url}' \
+        --data-urlencode "_username=${username}" \
+        --data-urlencode "_password=${ADMIN_PASSWORD}" \
+        --data-urlencode "_csrf_token=${token}" \
+        "${url}")"
+    if [[ "${redirect}" == *"/wizard/"* ]]; then
+        echo "==> Login redirected to ${redirect}: first-login wizard is active (run ./tester-env wizard-off)" >&2
+        return 1
+    fi
+    # Follow redirects: an active wizard hijacks this GET to /en/wizard/<step>.
+    # The timesheet listing carries the create button, the wizard page does not.
+    body_file="$(mktemp)"
+    final="$(curl -sSL -b "${jar}" -c "${jar}" -o "${body_file}" -w '%{url_effective}' "$(web)/en/timesheet/")"
+    if [[ "${final}" == *"/wizard/"* ]]; then
+        echo "==> /en/timesheet/ redirected to ${final}: first-login wizard is active (run ./tester-env wizard-off)" >&2
+        rm -f "${body_file}"
+        return 1
+    fi
+    if ! grep -q '/en/timesheet/create' "${body_file}"; then
+        echo "==> /en/timesheet/ is not the authenticated timesheet listing" >&2
+        rm -f "${body_file}"
+        return 1
+    fi
+    rm -f "${body_file}"
+}
+
+check_login() { # check_login [username]
+    local jar
+    jar="$(mktemp)"
+    if login_jar "${jar}" "${1:-admin}"; then
+        rm -f "${jar}"
+        return 0
+    fi
+    rm -f "${jar}"
+    return 1
+}
+
+cmd_deploy() {
+    refresh_names
+    echo "==> Deploying Kimai (image=${IMAGE_NAME}, project=${COMPOSE_PROJECT}, port=${PORT})..."
+    build_base
+    compose up --build -d
+    wait_http
+    echo "==> Disabling the first-login wizard for existing users..."
+    db < "${SCRIPT_DIR}/tester-env.d/wizard-off.sql"
+    if ! check_login; then
+        echo "==> Login as admin / ${ADMIN_EMAIL} failed after start" >&2
+        compose logs --tail=80 app db || true
+        return 1
+    fi
+    echo "==> Deployment complete."
+    echo "    URL:         http://localhost:${PORT}/"
+    echo "    Credentials: admin / ${ADMIN_PASSWORD} (${ADMIN_EMAIL})"
+    echo "    Browser MCP: http://host.docker.internal:${PORT}/"
+}
+
+cmd_verify() {
+    refresh_names
+    require_running
+    local body jar failed=0
+
+    echo "==> Verifying GET $(web)/en/login ..."
+    body="$(curl -fsS "$(web)/en/login")"
+    grep -q 'name="_password"' <<<"${body}" || { echo "==> /en/login is not the login form" >&2; return 1; }
+    echo "    OK (login form served)"
+
+    echo "==> Verifying seeded row counts ..."
+    check_row() { # check_row <label> <expected> <sql>
+        local label="$1" expected="$2" sql="$3" actual
+        actual="$(db -N -B -e "${sql}" | tr -d '\r')"
+        if [[ "${actual}" != "${expected}" ]]; then
+            echo "    FAIL ${label}: expected ${expected}, got ${actual}" >&2
+            failed=1
+        else
+            echo "    OK ${label} = ${actual}"
+        fi
+    }
+
+    check_row 'users'                 5      'SELECT COUNT(*) FROM kimai2_users WHERE username IN ("admin","lena","mara","jonas","priya")'
+    check_row 'customers'             3      'SELECT COUNT(*) FROM kimai2_customers WHERE id BETWEEN 1001 AND 1099'
+    check_row 'projects'              5      'SELECT COUNT(*) FROM kimai2_projects WHERE id BETWEEN 1001 AND 1099'
+    check_row 'activities'            11     'SELECT COUNT(*) FROM kimai2_activities WHERE id BETWEEN 1001 AND 1099'
+    check_row 'tags'                  6      'SELECT COUNT(*) FROM kimai2_tags WHERE id BETWEEN 1001 AND 1099'
+    check_row 'teams'                 1      'SELECT COUNT(*) FROM kimai2_teams WHERE id BETWEEN 1001 AND 1099'
+    check_row 'team members'          4      'SELECT COUNT(*) FROM kimai2_users_teams WHERE team_id = 1001'
+    check_row 'timesheets'            48     'SELECT COUNT(*) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099'
+    check_row 'timesheet tag links'   32     'SELECT COUNT(*) FROM kimai2_timesheet_tags WHERE timesheet_id BETWEEN 1001 AND 1099'
+    check_row 'billable timesheets'   45     'SELECT COUNT(*) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND billable = 1'
+    check_row 'stopped timesheets'    48     'SELECT COUNT(*) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND end_time IS NOT NULL'
+    check_row 'total duration (s)'    414000 'SELECT SUM(duration) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099'
+    check_row 'billable rate (EUR)'   10260  'SELECT SUM(rate) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND billable = 1'
+    check_row 'non-billable rate'     665    'SELECT SUM(rate) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND billable = 0'
+    check_row 'first seeded date'     2026-10-05 'SELECT MIN(date_tz) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099'
+    check_row 'last seeded date'      2026-11-20 'SELECT MAX(date_tz) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099'
+    check_row 'admin timesheets'      6      'SELECT COUNT(*) FROM kimai2_timesheet t JOIN kimai2_users u ON u.id = t.user WHERE t.id BETWEEN 1001 AND 1099 AND u.username = "admin"'
+    check_row 'jonas timesheets'      12     'SELECT COUNT(*) FROM kimai2_timesheet t JOIN kimai2_users u ON u.id = t.user WHERE t.id BETWEEN 1001 AND 1099 AND u.username = "jonas"'
+    check_row 'priya timesheets'      14     'SELECT COUNT(*) FROM kimai2_timesheet t JOIN kimai2_users u ON u.id = t.user WHERE t.id BETWEEN 1001 AND 1099 AND u.username = "priya"'
+    check_row 'mara timesheets'       8      'SELECT COUNT(*) FROM kimai2_timesheet t JOIN kimai2_users u ON u.id = t.user WHERE t.id BETWEEN 1001 AND 1099 AND u.username = "mara"'
+    check_row 'lena timesheets'       8      'SELECT COUNT(*) FROM kimai2_timesheet t JOIN kimai2_users u ON u.id = t.user WHERE t.id BETWEEN 1001 AND 1099 AND u.username = "lena"'
+    # Kimai's time-budget card counts billable time only (templates/embeds/budgets.html.twig):
+    # Website Relaunch shows 44:00 / 100:00 in the quota bar but 51:00 working time.
+    check_row 'Website Relaunch total (s)'    183600 'SELECT SUM(duration) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND project_id = 1001'
+    check_row 'Website Relaunch billable (s)' 158400 'SELECT SUM(duration) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND project_id = 1001 AND billable = 1'
+    check_row 'Fleet Portal revenue (EUR)'    2587.5 'SELECT SUM(rate) FROM kimai2_timesheet WHERE id BETWEEN 1001 AND 1099 AND project_id = 1004'
+    check_row 'wizard preference rows' 5     'SELECT COUNT(*) FROM kimai2_user_preferences WHERE name = "__wizards__"'
+    check_row 'user.wizard config'    0      'SELECT value FROM kimai2_configuration WHERE name = "user.wizard"'
+
+    echo "==> Verifying seeded data is visible in the HTML ..."
+    jar="$(mktemp)"
+    if login_jar "${jar}"; then
+        body="$(curl -fsSL -b "${jar}" "$(web)/en/timesheet/")"
+        for needle in 'CMS template integration' 'Warehouse slot allocation'; do
+            if grep -qF "${needle}" <<<"${body}"; then
+                echo "    OK admin timesheet list shows '${needle}'"
+            else
+                echo "    FAIL admin timesheet list is missing '${needle}'" >&2
+                failed=1
+            fi
+        done
+        body="$(curl -fsSL -b "${jar}" "$(web)/en/admin/customer/")"
+        for needle in 'Harborline Media' 'Northstar Logistics' 'Copperline Bakery'; do
+            if grep -qF "${needle}" <<<"${body}"; then
+                echo "    OK customer list shows '${needle}'"
+            else
+                echo "    FAIL customer list is missing '${needle}'" >&2
+                failed=1
+            fi
+        done
+    else
+        echo "    FAIL admin login" >&2
+        failed=1
+    fi
+    rm -f "${jar}"
+
+    echo "==> Verifying seeded users log in and see their own entries (no wizard redirect) ..."
+    check_user_timesheet() { # check_user_timesheet <username> <needle>
+        local user="$1" needle="$2" user_jar
+        user_jar="$(mktemp)"
+        if ! login_jar "${user_jar}" "${user}"; then
+            echo "    FAIL ${user} login or wizard redirect" >&2
+            failed=1
+            rm -f "${user_jar}"
+            return
+        fi
+        if grep -qF "${needle}" <<<"$(curl -fsSL -b "${user_jar}" "$(web)/en/timesheet/")"; then
+            echo "    OK ${user} reaches /en/timesheet/ and sees '${needle}'"
+        else
+            echo "    FAIL ${user} timesheet list is missing '${needle}'" >&2
+            failed=1
+        fi
+        rm -f "${user_jar}"
+    }
+    check_user_timesheet 'mara' 'Retainer support queue'
+    check_user_timesheet 'jonas' 'Homepage hero rebuild'
+    check_user_timesheet 'priya' 'Bakery logo exploration'
+
+    if [[ "${failed}" -ne 0 ]]; then
+        echo "==> Verification FAILED" >&2
+        return 1
+    fi
+    echo "==> Verification complete."
+}
+
+# The wizard must be off for every user that exists right now; seed data may add
+# users later, so it is a separate command that seed tooling can call.
+cmd_wizard_off() {
+    refresh_names
+    require_running
+    echo "==> Marking the first-login wizard as seen for all existing users..."
+    db < "${SCRIPT_DIR}/tester-env.d/wizard-off.sql"
+    echo "==> Done."
+}
+
+cmd_seed() {
+    refresh_names
+    require_running
+    # data_seed stage owns the deterministic fixture; rl-env calls this on every
+    # run, so a missing fixture is a no-op, not a failure.
+    if [[ ! -f "${SCRIPT_DIR}/tester-env.d/seed.sql" ]]; then
+        echo "==> No seed fixture at tester-env.d/seed.sql yet (data_seed stage); nothing to do."
+        return 0
+    fi
+    echo "==> Creating seed users (idempotent, --ignore-existing)..."
+    # App-supported path: the CLI hashes the password with the configured
+    # hasher and creates the per-user preference rows. seed.sql then resolves
+    # them by username, so ids stay irrelevant.
+    while IFS='|' read -r username email role <&3; do
+        [[ -z "${username}" ]] && continue
+        compose exec -T -u www-data app php /opt/kimai/bin/console -n kimai:user:create \
+            "${username}" "${email}" "${role}" "${ADMIN_PASSWORD}" --ignore-existing
+    done 3<<'SEED_USERS'
+lena|lena@example.com|ROLE_ADMIN
+mara|mara@example.com|ROLE_TEAMLEAD
+jonas|jonas@example.com|ROLE_USER
+priya|priya@example.com|ROLE_USER
+SEED_USERS
+    echo "==> Applying deterministic seed (tester-env.d/seed.sql)..."
+    db < "${SCRIPT_DIR}/tester-env.d/seed.sql"
+    # Seed creates users, which must not be sent to the wizard.
+    db < "${SCRIPT_DIR}/tester-env.d/wizard-off.sql"
+    echo "==> Seed complete."
+}
+
+require_running() {
+    if [[ -z "$(compose ps -q app 2>/dev/null)" ]]; then
+        echo "==> Stack is not running; run ./tester-env deploy first" >&2
+        return 1
+    fi
+}
+
+cmd_reset() {
+    refresh_names
+    echo "==> Resetting environment (containers + db/var volumes, image kept)..."
+    compose down -v --remove-orphans
+    echo "==> Clean slate."
+}
+
+cmd_stop() {
+    refresh_names
+    echo "==> Stopping containers (volumes preserved)..."
+    compose stop
+    echo "==> Stopped."
+}
+
+cmd_start() {
+    refresh_names
+    echo "==> Starting containers (no rebuild; use deploy to pick up source edits)..."
+    compose up -d
+    wait_http
+    echo "==> Started. URL: http://localhost:${PORT}/"
+}
+
+cmd_logs() {
+    refresh_names
+    compose logs --tail=200 app db 2>/dev/null || echo "==> Containers not running."
+}
+
+cmd_status() {
+    refresh_names
+    if [[ -n "$(compose ps -q 2>/dev/null)" ]]; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Project: ${COMPOSE_PROJECT}"
+        docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
+            --format '  {{.Names}}  {{.Status}}  {{.Ports}}'
+        curl -fsS -o /dev/null -w '  GET /en/login -> HTTP %{http_code}\n' "$(web)/en/login" 2>/dev/null \
+            || echo "  GET /en/login not answering"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Project: ${COMPOSE_PROJECT}"
+    fi
+}
+
+cmd_url() {
+    refresh_names
+    echo "http://localhost:${PORT}/"
+}
+
+cmd_help() {
+    cat <<'EOF'
+Kimai - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build from this checkout and start app + MariaDB. The entrypoint
+            installs the schema and creates the super admin from
+            ADMINMAIL/ADMINPASS; the first-login wizard is then disabled.
+  seed      Apply tester-env.d/seed.sql when the data_seed stage authored one
+            (no-op until then) and re-disable the wizard for new users
+  verify    Assert /en/login serves the form and admin login reaches
+            /en/timesheet/ without a wizard redirect
+  wizard-off
+            Mark the first-login wizard as seen for all existing users
+  reset     docker compose down -v (db + var volumes), image kept
+  stop      Stop containers (volumes preserved)
+  start     Start existing containers without rebuilding
+  logs      Show the last 200 app + db log lines
+  status    Show containers, URL and GET /en/login status
+  url       Print the local URL
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate compose project + volumes for parallel runs. Default: default
+  --port <port>   Host port for Apache. Default: 18280 (or $PORT)
+
+Env knobs: PORT, RUN_ID, IMAGE_TAG (set by scripts/rl-env),
+DEFAULT_ADMIN_EMAIL / DEFAULT_ADMIN_PASSWORD, APP_SECRET.
+
+Stack: only ${PORT} is published (Apache 8001); MariaDB 3306 stays on the
+compose network. Source edits need deploy (rebuild): prod opcache does not
+revalidate timestamps, and the source lives in the image.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id) RUN_ID="${2:?--run-id requires a value}"; shift 2 ;;
+            --port) PORT="${2:?--port requires a value}"; shift 2 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Unknown option: $1"; cmd_help; exit 1 ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        wizard-off) cmd_wizard_off ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        start) cmd_start ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        url) cmd_url ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Unknown command: ${cmd}"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

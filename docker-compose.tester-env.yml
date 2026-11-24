@@ -1,0 +1,54 @@
+# Fork-owned Kimai deployment for the RL tester environment.
+# Upstream ships no compose file; this overlay is what ./tester-env drives.
+#
+# Only ${PORT} is published. app/db talk over the compose default bridge
+# network; no subnet is pinned.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: tester-env.d/Containerfile
+      target: prod
+      args:
+        BASE_IMAGE: ${KIMAI_BASE_IMAGE:-tester-env-kimai-base:dev}
+    # Content-addressed tag supplied by scripts/rl-env; never scope it by RUN_ID.
+    image: ${IMAGE_TAG:-tester-env-kimai:dev}
+    ports:
+      - "${PORT:-18280}:8001"
+    environment:
+      APP_ENV: prod
+      # Fixed secret: sessions and remember-me cookies survive `stop`/`start`,
+      # and are dropped by `reset` (down -v).
+      APP_SECRET: ${APP_SECRET:-tester-env-kimai-dev-secret-0123456789abcdef}
+      DATABASE_URL: "mysql://kimai:kimai@db:3306/kimai?charset=utf8mb4&serverVersion=10.11.0-MariaDB"
+      # Deterministic times/dates in the UI; the container clock stays UTC.
+      TIMEZONE: UTC
+      # Read by .docker/entrypoint.sh: kimai:user:create --ignore-existing.
+      ADMINMAIL: ${ADMINMAIL:-admin@example.com}
+      ADMINPASS: ${ADMINPASS:-tester-env-password}
+      MAILER_URL: null://localhost
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - var:/opt/kimai/var
+
+  db:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: kimai-root
+      MARIADB_DATABASE: kimai
+      MARIADB_USER: kimai
+      MARIADB_PASSWORD: kimai
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - db:/var/lib/mysql
+
+volumes:
+  var:
+  db:

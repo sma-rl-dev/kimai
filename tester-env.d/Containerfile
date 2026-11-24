@@ -1,0 +1,59 @@
+# Fork-owned build for the RL tester environment (see docs/APP_CLI_PATTERN.md).
+#
+# Mirrors upstream's `prod` target with one difference that matters for mutation
+# loops: composer dependencies are installed in a separate target keyed on
+# composer.lock, so a source edit only invalidates the source COPY instead of
+# re-running `composer install`.
+#
+# The PHP 8.5/Apache base with the compiled extensions (gd, intl, ldap,
+# pdo_mysql, zip, xsl), ICU tzdata, the entrypoint and /dbtest.php is built once
+# from upstream's own Dockerfile base target by ./tester-env:
+#   docker build --build-arg BASE=apache --target base -t tester-env-kimai-base:dev .
+ARG BASE_IMAGE=tester-env-kimai-base:dev
+
+FROM ${BASE_IMAGE} AS deps
+COPY composer.json composer.lock symfony.lock /opt/kimai/
+# --no-scripts skips the auto-scripts (cache:clear, assets:install); they need
+# the source tree and are run explicitly in the prod stage below.
+RUN export COMPOSER_HOME=/composer && \
+    composer --no-ansi install --working-dir=/opt/kimai --no-dev --optimize-autoloader --no-scripts
+
+FROM ${BASE_IMAGE} AS prod
+ARG KIMAI=dev
+ENV KIMAI=${KIMAI}
+# APP_ENV=prod must be set before the build-time console commands below (the
+# base stage has no APP_ENV). DATABASE_URL intentionally keeps the base image's
+# placeholder during the build: an empty value makes DBAL resolve a unix-socket
+# connection and `kimai:version` fails. Real values come from compose at runtime.
+ENV APP_ENV=prod
+ENV memory_limit=512M
+
+COPY --from=deps /opt/kimai/vendor /opt/kimai/vendor
+# /assets/monolog.yaml is copied into config/packages by the entrypoint.
+COPY .docker /assets
+# Source last: this is the only layer a source mutation invalidates.
+COPY --chown=www-data:www-data . /opt/kimai
+# Prod PHP settings as upstream ships them. opcache.validate_timestamps=0 is
+# kept: every mutation rebuilds the image and recreates the container, so the
+# PHP process always starts with an empty opcache. Do not "fix" this to 1 -
+# a same-image restart cannot pick up source edits anyway, the image holds them.
+RUN cp /usr/local/etc/php/php.ini-production /usr/local/etc/php/php.ini && \
+    sed -i "s/expose_php = On/expose_php = Off/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/;opcache.enable=1/opcache.enable=1/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/;opcache.memory_consumption=128/opcache.memory_consumption=256/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/;opcache.interned_strings_buffer=8/opcache.interned_strings_buffer=24/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/;opcache.max_accelerated_files=10000/opcache.max_accelerated_files=100000/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/opcache.validate_timestamps=1/opcache.validate_timestamps=0/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/session.gc_maxlifetime = 1440/session.gc_maxlifetime = 604800/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/;session.upload_progress.enabled = On/session.upload_progress.enabled = Off/g" /usr/local/etc/php/php.ini && \
+    sed -i "s/;fatal_error_backtraces = On/fatal_error_backtraces = Off/g" /usr/local/etc/php/php.ini && \
+    mkdir -p /opt/kimai/var/log && chmod 777 /opt/kimai/var/log && \
+    sed "s/128M/-1/g" /usr/local/etc/php/php.ini-development > /opt/kimai/php-cli.ini && \
+    /opt/kimai/bin/console kimai:version | awk '{print $2}' > /opt/kimai/version.txt && \
+    test -s /opt/kimai/version.txt && \
+    /opt/kimai/bin/console assets:install --env=prod > /dev/null && \
+    chown -R www-data:www-data /opt/kimai /usr/local/etc/php/php.ini && \
+    rm -rf /opt/kimai/var/cache/*
+
+EXPOSE 8001
+CMD [ "/entrypoint.sh" ]
